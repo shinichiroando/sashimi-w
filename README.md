@@ -1,4 +1,10 @@
 # Semi-Analytical SubHalo Inference ModelIng for WDM (SASHIMI-W)
+[![arXiv](https://img.shields.io/badge/arXiv-2111.13137%20-green.svg)](https://arxiv.org/abs/2111.13137)
+
+The codes allow to calculate various subhalo properties efficiently using semi-analytical models for wold dark matter (WDM). The results are well in agreement with those from numerical N-body simulations.
+
+
+## References
 
 If you use the SASHIMI script to write a paper, please cite:
 
