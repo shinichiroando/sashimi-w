@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="SASHIMI-W logo" width="440">
+</p>
+
 # Semi-Analytical SubHalo Inference ModelIng for WDM (SASHIMI-W)
 [![arXiv](https://img.shields.io/badge/arXiv-2111.13137%20-green.svg)](https://arxiv.org/abs/2111.13137)
 
