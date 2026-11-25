@@ -1,4 +1,7 @@
+from types import SimpleNamespace
+
 import numpy as np
+from picard_tidal_stripping import endpoint_mass
 import matplotlib.pyplot as plt
 from scipy import integrate
 from scipy import interpolate
@@ -313,6 +316,61 @@ class subhalos:
         Mvir = 4*np.pi*rs**3*rhos*self.fc(rvir/rs)
         return Mvir
 
+    def _Mvir_from_M200_grid(self, M200, z):
+        """Convert paired host masses and epochs for a Picard integration grid.
+
+        Parameters
+        ----------
+        M200 : array_like
+            Physical mass in grams inside 200 times the critical density.
+        z : array_like
+            Dimensionless redshifts paired with M200.
+
+        Returns
+        -------
+        numpy.ndarray
+            Virial masses in grams with the broadcast shape.
+
+        Notes
+        -----
+        For the native concentration c200 and virial overdensity Delta(z),
+        solve f(cvir)/cvir**3 = Delta(z)/200 * f(c200)/c200**3, where
+        f(c) = ln(1+c) - c/(1+c). This is the same NFW conversion as the
+        scalar Mvir_from_M200. Each redshift has its own scalar root.
+
+        References
+        ----------
+        .. [1] Navarro, Frenk & White (1997), NFW density profile.
+           https://arxiv.org/abs/astro-ph/9611107
+        """
+        mass, epoch = np.broadcast_arrays(M200, z)
+        # The native two-dimensional concentration interface pairs each mass
+        # with its own redshift. The one-dimensional interface uses one epoch.
+        c200 = self.conc200(mass.reshape(-1, 1), epoch.reshape(-1, 1)).ravel()
+        delta = self.Delc(self.Omegaz(pOmega, epoch.ravel()) - 1.)
+        targets = (delta / 200.) * self.fc(c200) / c200**3
+
+        def residual(c, target):
+            """Evaluate the dimensionless mean-density residual for one halo.
+
+            Parameters
+            ----------
+            c, target : float
+                Trial concentration and target value of f(c)/c**3.
+
+            Returns
+            -------
+            float
+                Difference from the native virial overdensity condition.
+            """
+            return self.fc(c) / c**3 - target
+
+        cvir = np.array([optimize.brentq(residual, c / 10., c * 10., args=(target,),
+                                        xtol=1e-13, rtol=1e-13)
+                         for c, target in zip(c200, targets)])
+        return mass * (self.fc(cvir) / self.fc(c200)).reshape(mass.shape)
+
+
     def Mvir_from_M200_fit(self, M200, z):
         a1 = 0.5116
         a2 = -0.4283
@@ -465,7 +523,7 @@ class subhalos:
 
     def rs_rhos_calc(self, M0, redshift=0.0, dz=0.1, zmax=7.0, N_ma=100, sigmalogc=0.128,
                      N_herm=5, logmamin=1, logmamax=None, sigmafac=0,
-                     N_hermNa=200, profile_change=True):
+                     N_hermNa=200, profile_change=True, method="picard_table", **kwargs):
 
         zdist = np.arange(redshift+dz,zmax+dz,dz)
         if logmamax==None:
@@ -493,12 +551,10 @@ class subhalos:
                 M200 = 10**logM200
                 if(sigmafac>0.):
                     M200 = np.where(M200<M0,M200,M0)
-                Mz200solar = M200*Msolar
-                Mvirsolar = self.Mvir_from_M200(Mz200solar,z)
-            else:
-                Mz200solar = Mz200*Msolar
-                Mvirsolar = self.Mvir_from_M200(Mz200solar,z)
-            return Mvirsolar/Msolar
+                Mz200 = M200
+            if np.ndim(z) == 0:
+                return self.Mvir_from_M200(Mz200*Msolar, z)/Msolar
+            return self._Mvir_from_M200_grid(Mz200*Msolar, z)/Msolar
 
         """ Fitting functions for A, zeta """
         def AMz(z):
@@ -514,12 +570,62 @@ class subhalos:
         def msolve(m, z):
             return AMz(z)*(m/tdynz(z))*pow(m/Mzvir(z),zetaMz(z))*pow(self.Hz(z)*(1+z),-1)
 
+        if method == "picard_table":
+            # A table requests the same host epochs for the mass, rate and
+            # exponent. Cache only this catalogue's distinct host redshifts.
+            native_host = Mzvir
+            host_masses = {}
+
+            def table_host(z):
+                """Look up virial host masses on a possibly repeated redshift grid.
+
+                Parameters
+                ----------
+                z : array_like
+                    Dimensionless redshifts for this catalogue's host history.
+
+                Returns
+                -------
+                numpy.ndarray
+                    Virial mass in solar masses, with the shape of z.
+                """
+                epochs, inverse = np.unique(z, return_inverse=True)
+                missing = np.array([epoch for epoch in epochs if epoch not in host_masses])
+                if missing.size:
+                    host_masses.update(zip(missing, native_host(missing)))
+                values = np.array([host_masses[epoch] for epoch in epochs])
+                return values[inverse].reshape(np.shape(z))
+
+            Mzvir = table_host
+
+            def Phi(z):
+                """Evaluate the stripping amplitude per unit redshift.
+
+                Parameters
+                ----------
+                z : array_like
+                    Dimensionless redshifts along the host history.
+
+                Returns
+                -------
+                numpy.ndarray
+                    A divided by the dynamical time, H(z) and 1+z.
+                """
+                return AMz(z) / (tdynz(z) * self.Hz(z) * (1 + z))
+
+            solver = SimpleNamespace(Mzvir=Mzvir, zetaMz=zetaMz, Phi=Phi,
+                                     z_min=redshift, z_max=zmax)
+        elif method != "odeint":
+            raise ValueError(f"Unknown stripping method: {method}")
+
         for iz in range(len(zdist)):
             ma = self.Mvir_from_M200(ma200*Msolar,zdist[iz])/Msolar
             Oz = self.Omegaz(pOmega,zdist[iz])
-            zcalc = np.linspace(zdist[iz],redshift,100)
-            sol = odeint(msolve,ma,zcalc)
-            m0 = sol[-1]
+            if method == "picard_table":
+                m0 = endpoint_mass(solver, ma, zdist[iz], redshift, **kwargs)
+            else:
+                zcalc = np.linspace(zdist[iz], redshift, 100)
+                m0 = odeint(msolve, ma, zcalc, **kwargs)[-1]
             c200sub = self.conc200(ma200*Msolar,zdist[iz])
             rvirsub = pow(3*ma*Msolar*pow(rhocrit0*self.g(zdist[iz]) \
                 *self.Delc(Oz-1)*4*np.pi,-1),1.0/3.0)
@@ -583,10 +689,10 @@ class subhalos:
     # Output: subhalo masses in units [M_solar], subhalo distribution dN/dm
     #################################################################################
     def subhalo_distr(self,M0, accretion=False, redshift=0.0, dz=0.1, zmax=7.0, N_ma=500, sigmalogc=0.128, N_herm=5, logmamin=1, logmamax=None, \
-        sigmafac=0, N_hermNa=200, profile_change=True):
+        sigmafac=0, N_hermNa=200, profile_change=True, method="picard_table", **kwargs):
             
         ma200, z_a, rs_a, rhos_a, m0, rs0, rhos0, ct0, weight, survive = self.rs_rhos_calc(M0, redshift, dz, zmax, N_ma, sigmalogc,N_herm, \
-            logmamin, logmamax, sigmafac,N_hermNa, profile_change=True)
+            logmamin, logmamax, sigmafac,N_hermNa, profile_change=True, method=method, **kwargs)
 
         if accretion == False:
             N,lnm_edges = np.histogram(np.log(m0),weights=weight,bins=100)
@@ -611,10 +717,10 @@ class subhalos:
     # Output: Total number of satellites, subhalo masses [M_solar], cumulative distribution subhalo mass
     #################################################################################
     def N_sat(self,M0, Mpeak=None,Mpeak_thres=False,redshift=0.0, dz=0.1, zmax=7.0, N_ma=500, sigmalogc=0.128, N_herm=5, logmamin=1, logmamax=None, \
-        sigmafac=0, N_hermNa=200, profile_change=True):
+        sigmafac=0, N_hermNa=200, profile_change=True, method="picard_table", **kwargs):
             
         ma200, z_a, rs_a, rhos_a, m0, rs0, rhos0, ct0, weight, survive = self.rs_rhos_calc(M0, redshift, dz, zmax, N_ma, sigmalogc,N_herm, logmamin, \
-            logmamax, sigmafac,N_hermNa, profile_change=True)
+            logmamax, sigmafac,N_hermNa, profile_change=True, method=method, **kwargs)
 
         if Mpeak_thres == True:
             N,x_edges = np.histogram(ma200[ma200>Mpeak],weights=weight[ma200>Mpeak],bins=10000)
@@ -634,10 +740,10 @@ class subhalos:
     # Output: Total number of satellites, subhalo Vmax or Vpeak [km/s], cumulative distribution subhalo Vmax or Vpeak
     #################################################################################
     def N_sat_Vthres(self,M0, Vpeak_max,Vpeak_thres=True,redshift=0.0, dz=0.1, zmax=7.0, N_ma=500, sigmalogc=0.128, N_herm=5, logmamin=1, logmamax=None, \
-        sigmafac=0, N_hermNa=200, profile_change=True):
+        sigmafac=0, N_hermNa=200, profile_change=True, method="picard_table", **kwargs):
             
         ma200, z_a, rs_a, rhos_a, m0, rs0, rhos0, ct0, weight, survive = self.rs_rhos_calc(M0, redshift, dz, zmax, N_ma, sigmalogc,N_herm, logmamin, \
-            logmamax, sigmafac,N_hermNa, profile_change=True)
+            logmamax, sigmafac,N_hermNa, profile_change=True, method=method, **kwargs)
 
         ma200  *= Msolar
         m0     *= Msolar
