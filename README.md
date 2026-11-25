@@ -8,6 +8,18 @@
 The codes allow to calculate various subhalo properties efficiently using semi-analytical models for wold dark matter (WDM). The results are well in agreement with those from numerical N-body simulations.
 
 
+## Tidal mass loss
+
+The WDM catalogue and its distribution and satellite-count methods use
+`method="picard_table"` to interpolate bound mass at the observation
+redshift. Pass `method="odeint"` to select the original mass-space ODE solver.
+Picard integrates the native stripping equation
+from accretion to observation using three nonlinear updates. A fourth update
+checks iteration convergence. Quadrature and interpolation also contribute to
+the mass error. The table covers `0 <= z <= za <= 7` and
+`-24 <= log10(ma/Mvir(za)) <= 3`. Outside these limits or when the iteration
+check fails, the solver issues a warning and directly integrates log mass.
+
 ## References
 
 If you use the SASHIMI script to write a paper, please cite:
